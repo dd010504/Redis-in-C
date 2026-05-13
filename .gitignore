@@ -1,0 +1,23 @@
+# Build output (CMake/Ninja)
+build/
+out/
+cmake-build-*/
+
+# Compiler artifacts
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.exe
+
+# LSP / tooling
+compile_commands.json
+.cache/
+.clangd/
+
+# Editor cruft
+.vscode/
+.idea/
+*.swp
+*~
