@@ -33,6 +33,8 @@ add_executable(redis-in-c
     src/hashtable.c
     src/networking.c
     src/resp.c
+    src/bytebuf.c
+    src/command.c
 )
 
 target_include_directories(redis-in-c PRIVATE src)

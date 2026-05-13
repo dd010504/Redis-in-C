@@ -1,26 +1,27 @@
 /*
  * networking.h - public entry points for the single-threaded event loop.
  *
- * Current state (Phase 2 step 1)
+ * Current state (Phase 2 step 3)
  * ------------------------------
  *   - One listening socket on 127.0.0.1:6379, non-blocking.
- *   - One epoll(7) instance running in LEVEL-TRIGGERED mode (no EPOLLET).
- *     Level-triggered means the kernel re-notifies us until the condition
- *     is gone, so we only do one read() / write() per event instead of
- *     looping until EAGAIN. Easier to reason about while learning; we can
- *     switch to edge-triggered later if we need the throughput.
- *   - Per-connection state lives in a heap-allocated struct attached to
- *     epoll_event.data.ptr. Listening socket uses data.ptr == NULL as a
- *     sentinel so we can dispatch without a hash lookup.
- *   - Today the bytes a client sends are simply echoed back. The hashtable
- *     pointer handed to net_init() is stashed for step 2 but not yet read.
+ *   - One epoll(7) instance in LEVEL-TRIGGERED mode (no EPOLLET).
+ *   - Per-connection state lives in a heap-allocated struct attached
+ *     to epoll_event.data.ptr. The listening socket uses data.ptr ==
+ *     NULL as a sentinel so dispatch doesn't need a hash lookup.
+ *   - Each connection has two growable byte buffers (bytebuf_t): one
+ *     for incoming bytes (parsed by resp_parse_request) and one for
+ *     queued replies (filled by command_execute, drained to the
+ *     socket by handle_write).
+ *   - EPOLLIN is armed at all times during normal operation; EPOLLOUT
+ *     is armed whenever there are pending reply bytes.
+ *   - Commands implemented: PING, GET, SET, DEL, EXISTS, COMMAND.
+ *     redis-cli -p 6379 talks to this server end-to-end.
  *
- * Next steps (not yet implemented)
- * --------------------------------
- *   - Step 2: parse RESP frames (arrays of bulk strings, plus inline
- *     commands) out of the per-connection read buffer.
- *   - Step 3: dispatch GET / SET / DEL / PING against the shared
- *     hashtable_t and write a RESP reply back to the client.
+ * Not yet here (see roadmap)
+ * --------------------------
+ *   - TTL / EXPIRE (Phase 4)
+ *   - INCR / DECR / KEYS / DBSIZE / FLUSHDB (Phase 3 follow-ups)
+ *   - Edge-triggered epoll, CLI flags, benchmarking (Phase 6)
  */
 
 #ifndef REDIS_IN_C_NETWORKING_H

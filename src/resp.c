@@ -20,6 +20,7 @@
 
 #include "resp.h"
 
+#include <inttypes.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -289,4 +290,48 @@ resp_status_t resp_parse_request(const unsigned char *input,
         return parse_multi_bulk(input, len, out);
     }
     return parse_inline(input, len, out);
+}
+
+/* ------------------------------------------------------------------------- */
+/* Reply serializers                                                         */
+/* ------------------------------------------------------------------------- */
+
+int resp_reply_simple_string(bytebuf_t *out, const char *s)
+{
+    if (bytebuf_append(out, "+", 1) < 0)            return -1;
+    if (bytebuf_append(out, s, strlen(s)) < 0)      return -1;
+    return bytebuf_append(out, "\r\n", 2);
+}
+
+int resp_reply_error(bytebuf_t *out, const char *msg)
+{
+    if (bytebuf_append(out, "-", 1) < 0)            return -1;
+    if (bytebuf_append(out, msg, strlen(msg)) < 0)  return -1;
+    return bytebuf_append(out, "\r\n", 2);
+}
+
+int resp_reply_integer(bytebuf_t *out, int64_t n)
+{
+    return bytebuf_appendf(out, ":%" PRId64 "\r\n", n);
+}
+
+int resp_reply_bulk(bytebuf_t *out, const void *bytes, size_t len)
+{
+    /* "$<len>\r\n" header, then the binary body, then a trailing CRLF.
+     * Bulk strings are length-prefixed, so the body may contain any
+     * bytes -- NULs and 0xff round-trip cleanly. */
+    if (bytebuf_appendf(out, "$%zu\r\n", len) < 0) return -1;
+    if (bytebuf_append(out, bytes, len) < 0)       return -1;
+    return bytebuf_append(out, "\r\n", 2);
+}
+
+int resp_reply_nil(bytebuf_t *out)
+{
+    /* RESP2 nil is the special "$-1\r\n" bulk-string sentinel. */
+    return bytebuf_append(out, "$-1\r\n", 5);
+}
+
+int resp_reply_array_header(bytebuf_t *out, size_t n)
+{
+    return bytebuf_appendf(out, "*%zu\r\n", n);
 }

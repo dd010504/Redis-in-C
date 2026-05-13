@@ -1,54 +1,61 @@
 /*
- * networking.c - Phase 2 step 1: single-threaded, level-triggered epoll
- *                event loop. For now it just echoes received bytes back
- *                to the client. RESP framing and hashtable dispatch land
- *                in step 2.
+ * networking.c - Phase 2 step 3: single-threaded, level-triggered epoll
+ *                event loop with full RESP command dispatch.
  *
  * Design summary
  * --------------
  *   - One listening socket on 127.0.0.1:6379 (loopback only; flip to
  *     INADDR_ANY later when the protocol layer is hardened).
  *   - Non-blocking sockets everywhere; the loop drives all I/O.
- *   - epoll(7) in LEVEL-TRIGGERED mode (no EPOLLET). That means the
- *     kernel keeps re-notifying us until the condition is gone, so we
- *     only need one read() / write() per event instead of looping to
- *     EAGAIN. Easier to reason about while we're learning.
- *   - Per-connection state lives in a heap-allocated conn_t pointed to
+ *   - epoll(7) in LEVEL-TRIGGERED mode (no EPOLLET). The kernel keeps
+ *     re-notifying us until the condition is gone, which lets us read
+ *     and write in straightforward loops without strict EAGAIN-state
+ *     bookkeeping.
+ *   - Per-connection state (conn_t) is heap-allocated and pointed to
  *     by epoll_event.data.ptr. The listening socket uses data.ptr ==
- *     NULL as a sentinel so we can tell the two apart without a hash.
- *   - We keep a singly-linked list (g_conns) of every active conn_t so
- *     that on SIGINT we can close+free every connection cleanly. This
- *     keeps the server valgrind-clean across Ctrl-C.
+ *     NULL as a sentinel so dispatch doesn't need a hash lookup.
+ *   - g_conns is a singly-linked list of every live conn_t so that on
+ *     SIGINT we can close + free every connection cleanly. Keeps the
+ *     server valgrind-clean across Ctrl-C.
  *
- * Echo flow (half-duplex, fixed 4 KiB buffer)
- * -------------------------------------------
- *   - When a conn's buffer is empty, we only listen for EPOLLIN.
- *   - When EPOLLIN fires, we read up to CONN_BUF_SIZE bytes into the
- *     buffer and immediately switch interest to EPOLLOUT.
- *   - When EPOLLOUT fires, we write what's left from the buffer; once
- *     drained we switch interest back to EPOLLIN.
- *   - That toggling is what saves us from needing a queue: at any
- *     moment a connection is either "wants to read" or "wants to
- *     write", never both. It also throttles each client to 4 KiB
- *     in-flight, which is fine for an echo demo.
+ * Read/dispatch/write flow (no half-duplex toggle anymore)
+ * --------------------------------------------------------
+ *   handle_read():
+ *     1. read() into in_buf.tail until EAGAIN, EOF, or BYTEBUF_MAX.
+ *     2. Loop: resp_parse_request -> command_execute (which appends a
+ *        reply to out_buf) -> bytebuf_consume. Stops on NEED_MORE
+ *        (wait for more bytes) or PROTOCOL_ERR (queue an error reply
+ *        and mark the connection for closure once out_buf drains).
+ *     3. If a read error was deferred (e.g. BYTEBUF_MAX hit), append
+ *        the error AFTER any successful replies so ordering is sane.
+ *     4. Adjust interest: EPOLLIN if still accepting more input;
+ *        EPOLLOUT if any unsent reply remains.
  *
- * Allocation summary
- * ------------------
- *   site                          allocates              freed by
- *   ---------------------------   --------------------   --------------------
- *   accept_clients (new client)   one conn_t             close_conn (EOF /
- *                                                        error / EPOLLHUP) or
- *                                                        teardown loop in
- *                                                        net_run on shutdown
+ *   handle_write():
+ *     1. write() from out_buf.head until EAGAIN or drained.
+ *     2. On drain: close if close_after_drain is set; else disarm
+ *        EPOLLOUT and keep EPOLLIN armed for the next request.
  *
- *   The conn_t's `buf[]` is an inline array (no separate malloc), and the
- *   hashtable_t pointer is borrowed. So there is exactly one malloc/free
- *   pairing in this whole file.
+ * Allocation summary (every malloc has a matching free pinned below):
+ *
+ *   site                              allocates             freed by
+ *   ------------------------------    -------------------   ----------------
+ *   accept_clients (new client)       one conn_t            close_conn / shutdown
+ *                                                           teardown in net_run
+ *   bytebuf growth inside conn->in_buf  backing byte array  bytebuf_free
+ *   bytebuf growth inside conn->out_buf backing byte array  bytebuf_free
+ *
+ *   close_conn calls bytebuf_free on both buffers BEFORE free()-ing
+ *   the conn_t, so the byte arrays never outlive the struct.
  */
 
 #define _GNU_SOURCE  /* for accept4(), if available -- harmless otherwise */
 
 #include "networking.h"
+
+#include "bytebuf.h"
+#include "command.h"
+#include "resp.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -71,30 +78,30 @@
 #define LISTEN_HOST   "127.0.0.1"
 #define LISTEN_PORT   6379
 #define MAX_EVENTS    64           /* epoll_wait batch size                 */
-#define CONN_BUF_SIZE 4096         /* per-connection echo buffer            */
+#define READ_CHUNK    4096         /* per-iteration read() request size     */
 
 /* ------------------------------------------------------------------------- */
 /* Per-connection state                                                      */
 /* ------------------------------------------------------------------------- */
 
 typedef struct conn {
-    int           fd;
-    unsigned char buf[CONN_BUF_SIZE];
-    size_t        buf_len;     /* total bytes currently held in buf     */
-    size_t        buf_off;     /* bytes already written from buf        */
-    uint32_t      events;      /* current epoll interest mask           */
-    struct conn  *next;        /* link in g_conns list                  */
+    int          fd;
+    bytebuf_t    in_buf;             /* bytes read from peer, fed to parser  */
+    bytebuf_t    out_buf;            /* serialized replies awaiting write    */
+    uint32_t     events;             /* current epoll interest mask          */
+    int          close_after_drain;  /* close once out_buf is fully written  */
+    struct conn *next;               /* link in g_conns                      */
 } conn_t;
 
 /* ------------------------------------------------------------------------- */
 /* Module-private state                                                      */
 /* ------------------------------------------------------------------------- */
 
-static hashtable_t            *g_store     = NULL;   /* borrowed; step 2     */
+static hashtable_t            *g_store     = NULL;   /* borrowed for command dispatch */
 static int                     g_listen_fd = -1;
 static int                     g_epoll_fd  = -1;
-static conn_t                 *g_conns     = NULL;   /* head of conn list    */
-static volatile sig_atomic_t   g_shutdown  = 0;      /* set from signal hdlr */
+static conn_t                 *g_conns     = NULL;
+static volatile sig_atomic_t   g_shutdown  = 0;
 
 /* ------------------------------------------------------------------------- */
 /* Forward declarations                                                      */
@@ -117,8 +124,6 @@ static void on_signal(int sig);
 
 static int set_nonblock(int fd)
 {
-    /* Read the current flags, OR in O_NONBLOCK, write them back. We
-     * don't clobber unrelated flags this way. */
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags < 0) {
         perror("fcntl(F_GETFL)");
@@ -139,8 +144,7 @@ static int setup_listener(uint16_t port)
         return -1;
     }
 
-    /* SO_REUSEADDR lets us rebind to the port immediately after a
-     * crash/exit instead of waiting for TIME_WAIT to drain. */
+    /* SO_REUSEADDR so we can rebind immediately after a crash/exit. */
     int yes = 1;
     if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes) < 0) {
         perror("setsockopt(SO_REUSEADDR)");
@@ -184,8 +188,7 @@ static int setup_listener(uint16_t port)
 
 static int arm_events(conn_t *c, uint32_t events)
 {
-    /* No-op fast path: avoid a syscall when the interest mask isn't
-     * actually changing. EPOLL_CTL_MOD is cheap but not free. */
+    /* No-op fast path when the interest mask isn't actually changing. */
     if (c->events == events) {
         return 0;
     }
@@ -207,10 +210,7 @@ static int arm_events(conn_t *c, uint32_t events)
 
 static void accept_clients(void)
 {
-    /* In level-triggered mode we technically only need to accept once
-     * per event -- the kernel will re-notify if more are pending. But
-     * draining is cheap and reduces wakeups under load, so we loop
-     * until accept() returns EAGAIN/EWOULDBLOCK. */
+    /* Drain accept until EAGAIN -- one syscall storm per epoll wake. */
     for (;;) {
         struct sockaddr_in peer;
         socklen_t          peer_len = sizeof peer;
@@ -219,7 +219,7 @@ static void accept_clients(void)
                                              &peer_len);
         if (cfd < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                return;  /* no more pending connections */
+                return;
             }
             if (errno == EINTR) {
                 continue;
@@ -240,24 +240,26 @@ static void accept_clients(void)
             close(cfd);
             continue;
         }
-        c->fd      = cfd;
-        c->buf_len = 0;
-        c->buf_off = 0;
-        c->events  = 0;
-        c->next    = g_conns;
-        g_conns    = c;
+        c->fd                = cfd;
+        c->events            = 0;
+        c->close_after_drain = 0;
+        bytebuf_init(&c->in_buf);
+        bytebuf_init(&c->out_buf);
+        c->next = g_conns;
+        g_conns = c;
 
-        /* Register with epoll. Start in "wants to read" mode since the
-         * buffer is empty. arm_events() uses EPOLL_CTL_MOD, so we do
-         * the initial ADD by hand here. */
+        /* Register with epoll. Start in "wants to read" mode -- the
+         * out_buf is empty so EPOLLOUT would just busy-wake us. */
         struct epoll_event ev;
         memset(&ev, 0, sizeof ev);
         ev.events   = EPOLLIN;
         ev.data.ptr = c;
         if (epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, cfd, &ev) < 0) {
             perror("epoll_ctl(ADD)");
-            /* Unlink and free -- conn_t was just prepended to g_conns. */
+            /* Unlink + free everything we just allocated. */
             g_conns = c->next;
+            bytebuf_free(&c->in_buf);
+            bytebuf_free(&c->out_buf);
             free(c);
             close(cfd);
             continue;
@@ -273,16 +275,16 @@ static void accept_clients(void)
 
 static void close_conn(conn_t *c)
 {
-    /* EPOLL_CTL_DEL before close() to be tidy; the kernel removes the
-     * fd from the epoll set on close anyway, but being explicit keeps
-     * us safe against dup()/fork() surprises later. */
+    /* Explicit DEL before close() to be tidy; the kernel removes the
+     * fd on close anyway, but being explicit keeps us safe against
+     * dup()/fork() surprises later. */
     if (g_epoll_fd >= 0) {
         epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, c->fd, NULL);
     }
+    int saved_fd = c->fd;
     close(c->fd);
 
-    /* Unlink from g_conns. The list is singly-linked and short under
-     * the expected workload, so a linear scan is fine. */
+    /* Unlink from g_conns. */
     conn_t **link = &g_conns;
     while (*link != NULL && *link != c) {
         link = &(*link)->next;
@@ -291,7 +293,10 @@ static void close_conn(conn_t *c)
         *link = c->next;
     }
 
-    fprintf(stderr, "[networking] closed fd=%d\n", c->fd);
+    bytebuf_free(&c->in_buf);    /* releases growth allocations */
+    bytebuf_free(&c->out_buf);
+
+    fprintf(stderr, "[networking] closed fd=%d\n", saved_fd);
     free(c);   /* matches the malloc in accept_clients() */
 }
 
@@ -301,61 +306,132 @@ static void close_conn(conn_t *c)
 
 static int handle_read(conn_t *c)
 {
-    /* Half-duplex: only read when the buffer is empty. If for some
-     * reason EPOLLIN fires while we still have data to write, just
-     * ignore it -- arm_events() will switch us off EPOLLIN shortly. */
-    if (c->buf_len > 0) {
-        return 0;
+    /* If we're already in shutdown-after-drain mode, just adjust
+     * interest and let handle_write finish the job. */
+    if (c->close_after_drain) {
+        if (bytebuf_len(&c->out_buf) == 0) {
+            return -1;
+        }
+        return arm_events(c, EPOLLOUT);
     }
 
-    ssize_t n = read(c->fd, c->buf, sizeof c->buf);
-    if (n == 0) {
-        return -1;   /* peer closed -- caller will close_conn() */
-    }
-    if (n < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
-            return 0;  /* spurious wake-up; try again later */
+    /* Drain socket into in_buf until EAGAIN or a soft error. We
+     * defer surfacing the error until AFTER dispatching any
+     * already-complete frames, so the error reply lands at the end
+     * of out_buf rather than ahead of legitimate replies. */
+    int         read_failed  = 0;
+    const char *read_err_msg = NULL;
+
+    for (;;) {
+        if (bytebuf_len(&c->in_buf) >= BYTEBUF_MAX) {
+            read_failed  = 1;
+            read_err_msg = "ERR request too large";
+            break;
         }
-        perror("read");
+
+        unsigned char *tail = bytebuf_reserve(&c->in_buf, READ_CHUNK);
+        if (tail == NULL) {
+            read_failed  = 1;
+            read_err_msg = "ERR out of memory";
+            break;
+        }
+
+        ssize_t n = read(c->fd, tail, READ_CHUNK);
+        if (n == 0) {
+            return -1;   /* peer closed -- caller will close_conn() */
+        }
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                break;
+            }
+            if (errno == EINTR) {
+                continue;
+            }
+            perror("read");
+            return -1;
+        }
+        bytebuf_advance(&c->in_buf, (size_t)n);
+    }
+
+    /* Dispatch every complete RESP frame currently in in_buf. */
+    command_ctx_t ctx = { .store = g_store, .out = &c->out_buf };
+    for (;;) {
+        resp_request_t req;
+        resp_status_t  st = resp_parse_request(bytebuf_data(&c->in_buf),
+                                               bytebuf_len(&c->in_buf),
+                                               &req);
+        if (st == RESP_NEED_MORE) {
+            break;
+        }
+        if (st == RESP_PROTOCOL_ERR) {
+            resp_reply_error(&c->out_buf, "ERR Protocol error");
+            c->close_after_drain = 1;
+            break;
+        }
+        /* RESP_OK */
+        if (command_execute(&ctx, &req) != 0) {
+            /* Reply formatting OOM -- can't continue cleanly. */
+            return -1;
+        }
+        bytebuf_consume(&c->in_buf, req.bytes_consumed);
+    }
+
+    /* Now (and only now) queue the read-side error if any. */
+    if (read_failed) {
+        resp_reply_error(&c->out_buf, read_err_msg);
+        c->close_after_drain = 1;
+    }
+
+    /* Nothing left to send and we're shutting down -- close now. */
+    if (c->close_after_drain && bytebuf_len(&c->out_buf) == 0) {
         return -1;
     }
 
-    c->buf_len = (size_t)n;
-    c->buf_off = 0;
-
-    /* Switch to write mode: we now have bytes to ship back. */
-    return arm_events(c, EPOLLOUT);
+    /* Adjust interest: EPOLLIN unless we're winding down, EPOLLOUT
+     * iff there's unsent data. */
+    uint32_t want = 0;
+    if (!c->close_after_drain) {
+        want |= EPOLLIN;
+    }
+    if (bytebuf_len(&c->out_buf) > 0) {
+        want |= EPOLLOUT;
+    }
+    if (want == 0) {
+        return -1;   /* defensive: nothing to wait on -> close */
+    }
+    return arm_events(c, want);
 }
 
 static int handle_write(conn_t *c)
 {
-    if (c->buf_len == 0) {
-        /* Shouldn't happen with the toggle scheme, but be defensive
-         * and just go back to reading. */
-        return arm_events(c, EPOLLIN);
+    /* Try to fully drain out_buf in one go. */
+    while (bytebuf_len(&c->out_buf) > 0) {
+        ssize_t n = write(c->fd,
+                          bytebuf_data(&c->out_buf),
+                          bytebuf_len(&c->out_buf));
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return 0;   /* kernel buffer full; retry on next EPOLLOUT */
+            }
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EPIPE || errno == ECONNRESET) {
+                return -1;  /* peer gone -- close */
+            }
+            perror("write");
+            return -1;
+        }
+        bytebuf_consume(&c->out_buf, (size_t)n);
     }
 
-    size_t  pending = c->buf_len - c->buf_off;
-    ssize_t n       = write(c->fd, c->buf + c->buf_off, pending);
-    if (n < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
-            return 0;  /* kernel buffer full; try again on next EPOLLOUT */
-        }
-        if (errno == EPIPE || errno == ECONNRESET) {
-            return -1; /* peer hung up mid-write -- close cleanly */
-        }
-        perror("write");
+    /* Drained. If we were waiting to close after this final flush, do it. */
+    if (c->close_after_drain) {
         return -1;
     }
 
-    c->buf_off += (size_t)n;
-    if (c->buf_off >= c->buf_len) {
-        /* Drained: clear the buffer and go back to reading. */
-        c->buf_len = 0;
-        c->buf_off = 0;
-        return arm_events(c, EPOLLIN);
-    }
-    return 0;
+    /* Otherwise just disarm EPOLLOUT and wait for the next request. */
+    return arm_events(c, EPOLLIN);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -365,8 +441,7 @@ static int handle_write(conn_t *c)
 static void on_signal(int sig)
 {
     (void)sig;
-    /* Setting a sig_atomic_t is the only thing we're allowed to do
-     * safely in a signal handler with these signatures. epoll_wait()
+    /* Only a sig_atomic_t store is async-signal-safe here. epoll_wait
      * will return EINTR and the main loop checks g_shutdown. */
     g_shutdown = 1;
 }
@@ -377,7 +452,7 @@ static void on_signal(int sig)
 
 int net_init(hashtable_t *store)
 {
-    g_store = store;  /* borrowed; step 2 will dispatch commands against it */
+    g_store = store;   /* borrowed; commands dispatch against it */
 
     g_listen_fd = setup_listener(LISTEN_PORT);
     if (g_listen_fd < 0) {
@@ -393,7 +468,7 @@ int net_init(hashtable_t *store)
     }
 
     /* Register the listening socket. data.ptr == NULL is our sentinel
-     * for "this event is on the listener" inside the dispatch switch. */
+     * for "this event is on the listener". */
     struct epoll_event ev;
     memset(&ev, 0, sizeof ev);
     ev.events   = EPOLLIN;
@@ -407,8 +482,8 @@ int net_init(hashtable_t *store)
         return -1;
     }
 
-    /* Install signal handlers for graceful shutdown. SA_RESTART is
-     * deliberately *not* set on epoll_wait -- we want EINTR so the
+    /* Install signal handlers for graceful shutdown. Deliberately not
+     * using SA_RESTART -- we want epoll_wait to return EINTR so the
      * loop checks g_shutdown promptly. */
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
@@ -417,8 +492,8 @@ int net_init(hashtable_t *store)
     sigaction(SIGINT,  &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
 
-    /* SIGPIPE would kill us if a peer closes mid-write. We handle the
-     * EPIPE return from write() ourselves, so just ignore the signal. */
+    /* SIGPIPE would kill us if a peer closes mid-write. We surface
+     * EPIPE from write() ourselves, so ignore the signal. */
     signal(SIGPIPE, SIG_IGN);
 
     fprintf(stderr, "[networking] listening on %s:%d (epoll level-triggered)\n",
@@ -434,8 +509,7 @@ int net_run(void)
         int n = epoll_wait(g_epoll_fd, events, MAX_EVENTS, -1);
         if (n < 0) {
             if (errno == EINTR) {
-                /* Likely SIGINT -- re-check the shutdown flag and either
-                 * exit cleanly or keep going. */
+                /* Likely SIGINT/SIGTERM -- re-check the flag and loop. */
                 continue;
             }
             perror("epoll_wait");
@@ -460,6 +534,7 @@ int net_run(void)
             conn_t *c = (conn_t *)events[i].data.ptr;
 
             if (ev & (EPOLLERR | EPOLLHUP)) {
+                /* Could still have buffered replies; just close. */
                 close_conn(c);
                 continue;
             }
@@ -478,8 +553,7 @@ int net_run(void)
         }
     }
 
-    /* Teardown: free every live conn, then the epoll/listen fds. We do
-     * this even on error paths so valgrind reports a clean exit. */
+    /* Teardown: free every live conn, then the epoll/listen fds. */
     fprintf(stderr, "[networking] shutting down...\n");
     while (g_conns != NULL) {
         conn_t *next = g_conns->next;
@@ -487,6 +561,8 @@ int net_run(void)
             epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, g_conns->fd, NULL);
         }
         close(g_conns->fd);
+        bytebuf_free(&g_conns->in_buf);
+        bytebuf_free(&g_conns->out_buf);
         free(g_conns);   /* matches the malloc in accept_clients() */
         g_conns = next;
     }

@@ -36,7 +36,10 @@
 #ifndef REDIS_IN_C_RESP_H
 #define REDIS_IN_C_RESP_H
 
+#include "bytebuf.h"
+
 #include <stddef.h>
+#include <stdint.h>
 
 /* Hard cap on the number of arguments in one command. Real Redis goes
  * far higher, but commands with > 32 args are rare and capping cheaply
@@ -88,5 +91,35 @@ typedef struct {
 resp_status_t resp_parse_request(const unsigned char *input,
                                  size_t               len,
                                  resp_request_t      *out);
+
+/* -------------------------------------------------------------------------
+ * Reply serializers (the write side of the wire protocol).
+ *
+ * Each function appends one RESP-encoded reply to `out`. They return
+ * 0 on success and -1 if the underlying bytebuf cannot grow (OOM or
+ * BYTEBUF_MAX exceeded) -- in the failure case the bytebuf is left in
+ * a valid but possibly partially-written state, so callers that hit
+ * an error should typically close the connection rather than try to
+ * recover.
+ * ------------------------------------------------------------------------- */
+
+/* "+<s>\r\n" -- simple status string, e.g. "OK", "PONG". */
+int resp_reply_simple_string(bytebuf_t *out, const char *s);
+
+/* "-<msg>\r\n" -- error string (caller includes any prefix like "ERR "). */
+int resp_reply_error(bytebuf_t *out, const char *msg);
+
+/* ":<n>\r\n" -- 64-bit signed integer. */
+int resp_reply_integer(bytebuf_t *out, int64_t n);
+
+/* "$<len>\r\n<bytes>\r\n" -- binary-safe bulk string. */
+int resp_reply_bulk(bytebuf_t *out, const void *bytes, size_t len);
+
+/* "$-1\r\n" -- the nil bulk reply used for cache misses. */
+int resp_reply_nil(bytebuf_t *out);
+
+/* "*<n>\r\n" -- array header only. Caller appends the N elements via
+ * the other serializers immediately after. */
+int resp_reply_array_header(bytebuf_t *out, size_t n);
 
 #endif /* REDIS_IN_C_RESP_H */

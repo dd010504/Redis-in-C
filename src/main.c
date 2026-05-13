@@ -1,6 +1,7 @@
 /*
- * main.c - entry point + smoke tests for Phase 1 (hashtable) and
- *          Phase 2 step 2 (RESP request parser).
+ * main.c - entry point + smoke tests for Phase 1 (hashtable),
+ *          Phase 2 step 2 (RESP parser), and Phase 2 step 3
+ *          (command dispatcher).
  *
  * Lifecycle (mirrors the memory contract documented in hashtable.h):
  *
@@ -12,11 +13,13 @@
  *   4. ht_destroy() frees every internal malloc before we exit so a
  *      future `valgrind --leak-check=full` will report zero in-use bytes.
  *
- * The RESP parser is library code only at this step -- the smoke test
- * exercises it directly here; networking.c will start calling it in
- * Phase 2 step 3 (command dispatch).
+ * The three smoke tests run at startup before the epoll loop so any
+ * regression in the parser, the dispatcher, or the hashtable shows
+ * up as a FAIL line before the server starts accepting clients.
  */
 
+#include "bytebuf.h"
+#include "command.h"
 #include "hashtable.h"
 #include "networking.h"
 #include "resp.h"
@@ -234,6 +237,203 @@ static void resp_smoke_test(void)
     fprintf(stderr, "[resp] %d / %d cases passed\n", g_resp_pass, g_resp_total);
 }
 
+/* ------------------------------------------------------------------------- */
+/* Phase 2 step 3 - command dispatcher smoke test                            */
+/* ------------------------------------------------------------------------- */
+
+static int g_cmd_total = 0;
+static int g_cmd_pass  = 0;
+
+/* Byte-exact comparison of the entire bytebuf payload against an
+ * expected literal. `expected` is `const void *` for the same reason
+ * slice_eq does it: callers may pass `char[]` or `unsigned char[]`. */
+static int bytebuf_eq(const bytebuf_t *b, const void *expected, size_t expected_len)
+{
+    if (bytebuf_len(b) != expected_len) {
+        return 0;
+    }
+    if (expected_len == 0) {
+        return 1;
+    }
+    return memcmp(bytebuf_data(b), expected, expected_len) == 0;
+}
+
+#define CMD_CHECK(name, cond) do {                                        \
+    g_cmd_total++;                                                        \
+    if (cond) {                                                           \
+        g_cmd_pass++;                                                     \
+        fprintf(stderr, "  [cmd]  %-30s OK\n",   (name));                 \
+    } else {                                                              \
+        fprintf(stderr, "  [cmd]  %-30s FAIL\n", (name));                 \
+    }                                                                     \
+} while (0)
+
+static void command_smoke_test(void)
+{
+    fprintf(stderr, "[smoke] running Phase 2 step 3 dispatcher smoke test...\n");
+
+    bytebuf_t out;
+    bytebuf_init(&out);
+    command_ctx_t ctx = { .store = &g_store, .out = &out };
+
+    /* 1. PING -> +PONG\r\n */
+    {
+        resp_request_t req = {
+            .argc = 1,
+            .args = { { (const unsigned char *)"PING", 4 } }
+        };
+        int rc = command_execute(&ctx, &req);
+        CMD_CHECK("PING", rc == 0 && bytebuf_eq(&out, "+PONG\r\n", 7));
+        bytebuf_reset(&out);
+    }
+
+    /* 2. PING <msg> -> bulk reply */
+    {
+        resp_request_t req = {
+            .argc = 2,
+            .args = {
+                { (const unsigned char *)"PING",  4 },
+                { (const unsigned char *)"hello", 5 }
+            }
+        };
+        int rc = command_execute(&ctx, &req);
+        CMD_CHECK("PING hello", rc == 0 && bytebuf_eq(&out, "$5\r\nhello\r\n", 11));
+        bytebuf_reset(&out);
+    }
+
+    /* 3. SET smoke_foo bar -> +OK\r\n */
+    {
+        resp_request_t req = {
+            .argc = 3,
+            .args = {
+                { (const unsigned char *)"SET",        3 },
+                { (const unsigned char *)"smoke_foo",  9 },
+                { (const unsigned char *)"bar",        3 }
+            }
+        };
+        int rc = command_execute(&ctx, &req);
+        CMD_CHECK("SET smoke_foo bar", rc == 0 && bytebuf_eq(&out, "+OK\r\n", 5));
+        bytebuf_reset(&out);
+    }
+
+    /* 4. GET smoke_foo -> $3\r\nbar\r\n */
+    {
+        resp_request_t req = {
+            .argc = 2,
+            .args = {
+                { (const unsigned char *)"GET",        3 },
+                { (const unsigned char *)"smoke_foo",  9 }
+            }
+        };
+        int rc = command_execute(&ctx, &req);
+        CMD_CHECK("GET smoke_foo", rc == 0 && bytebuf_eq(&out, "$3\r\nbar\r\n", 9));
+        bytebuf_reset(&out);
+    }
+
+    /* 5. GET smoke_nope -> $-1\r\n (nil) */
+    {
+        resp_request_t req = {
+            .argc = 2,
+            .args = {
+                { (const unsigned char *)"GET",         3 },
+                { (const unsigned char *)"smoke_nope", 10 }
+            }
+        };
+        int rc = command_execute(&ctx, &req);
+        CMD_CHECK("GET smoke_nope (miss)", rc == 0 && bytebuf_eq(&out, "$-1\r\n", 5));
+        bytebuf_reset(&out);
+    }
+
+    /* 6. EXISTS smoke_foo smoke_nope smoke_foo -> :2\r\n
+     *    (duplicates are counted, per real Redis semantics) */
+    {
+        resp_request_t req = {
+            .argc = 4,
+            .args = {
+                { (const unsigned char *)"EXISTS",      6 },
+                { (const unsigned char *)"smoke_foo",   9 },
+                { (const unsigned char *)"smoke_nope", 10 },
+                { (const unsigned char *)"smoke_foo",   9 }
+            }
+        };
+        int rc = command_execute(&ctx, &req);
+        CMD_CHECK("EXISTS foo nope foo", rc == 0 && bytebuf_eq(&out, ":2\r\n", 4));
+        bytebuf_reset(&out);
+    }
+
+    /* 7. DEL smoke_foo -> :1\r\n */
+    {
+        resp_request_t req = {
+            .argc = 2,
+            .args = {
+                { (const unsigned char *)"DEL",        3 },
+                { (const unsigned char *)"smoke_foo",  9 }
+            }
+        };
+        int rc = command_execute(&ctx, &req);
+        CMD_CHECK("DEL smoke_foo", rc == 0 && bytebuf_eq(&out, ":1\r\n", 4));
+        bytebuf_reset(&out);
+    }
+
+    /* 8. GET smoke_foo after DEL -> $-1\r\n */
+    {
+        resp_request_t req = {
+            .argc = 2,
+            .args = {
+                { (const unsigned char *)"GET",        3 },
+                { (const unsigned char *)"smoke_foo",  9 }
+            }
+        };
+        int rc = command_execute(&ctx, &req);
+        CMD_CHECK("GET smoke_foo after DEL", rc == 0 && bytebuf_eq(&out, "$-1\r\n", 5));
+        bytebuf_reset(&out);
+    }
+
+    /* 9. COMMAND -> *0\r\n (empty array; placates newer redis-cli) */
+    {
+        resp_request_t req = {
+            .argc = 1,
+            .args = { { (const unsigned char *)"COMMAND", 7 } }
+        };
+        int rc = command_execute(&ctx, &req);
+        CMD_CHECK("COMMAND -> empty array", rc == 0 && bytebuf_eq(&out, "*0\r\n", 4));
+        bytebuf_reset(&out);
+    }
+
+    /* 10. Unknown command -> -ERR unknown command 'XYZ'\r\n */
+    {
+        resp_request_t req = {
+            .argc = 1,
+            .args = { { (const unsigned char *)"XYZ", 3 } }
+        };
+        int rc = command_execute(&ctx, &req);
+        CMD_CHECK("XYZ (unknown command)",
+            rc == 0 && bytebuf_eq(&out, "-ERR unknown command 'XYZ'\r\n", 28));
+        bytebuf_reset(&out);
+    }
+
+    /* 11. SET with one arg -> wrong number of arguments error */
+    {
+        resp_request_t req = {
+            .argc = 2,
+            .args = {
+                { (const unsigned char *)"SET",      3 },
+                { (const unsigned char *)"only_key", 8 }
+            }
+        };
+        int rc = command_execute(&ctx, &req);
+        CMD_CHECK("SET wrong arity",
+            rc == 0 && bytebuf_eq(&out,
+                                  "-ERR wrong number of arguments for 'SET'\r\n",
+                                  42));
+        bytebuf_reset(&out);
+    }
+
+    bytebuf_free(&out);
+
+    fprintf(stderr, "[cmd]  %d / %d cases passed\n", g_cmd_pass, g_cmd_total);
+}
+
 int main(void)
 {
     /* Step 1: bring the store online. No heap activity. */
@@ -243,11 +443,14 @@ int main(void)
     smoke_test();
 
     /* Step 3: prove the RESP parser handles the wire forms it'll see
-     * from redis-cli (multi-bulk) and nc (inline) once step 3 of Phase 2
-     * wires it into the event loop. */
+     * from redis-cli (multi-bulk) and nc (inline). */
     resp_smoke_test();
 
-    /* Step 4: bring up the listener and enter the epoll loop. Blocks
+    /* Step 4: prove the command dispatcher produces the exact reply
+     * bytes redis-cli expects (and the right errors on miss/arity). */
+    command_smoke_test();
+
+    /* Step 5: bring up the listener and enter the epoll loop. Blocks
      * until SIGINT/SIGTERM. */
     if (net_init(&g_store) != 0) {
         fprintf(stderr, "[main] net_init failed\n");
@@ -256,7 +459,7 @@ int main(void)
     }
     int rc = net_run();
 
-    /* Step 5: tear down. ht_destroy() releases every malloc made by
+    /* Step 6: tear down. ht_destroy() releases every malloc made by
      * ht_set(); the hashtable_t struct itself is in BSS and goes away
      * with the process. */
     ht_destroy(&g_store);
