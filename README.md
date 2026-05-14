@@ -12,9 +12,16 @@ epoll-based event loops).
 buckets) with `SET` / `GET` / `DEL`. Done.
 
 **Phase 2 - The Skeleton:** single-threaded, level-triggered `epoll(7)`
-event loop on `127.0.0.1:6379` with full RESP2 wire protocol. Commands
-implemented: `PING`, `GET`, `SET`, `DEL`, `EXISTS`, `COMMAND`. Talks to
-`redis-cli` end-to-end. Done.
+event loop on `127.0.0.1:6379` speaking full RESP2. Done.
+
+**Phase 3 - String and key-space commands:** integer arithmetic
+(`INCR`, `DECR`, `INCRBY`, `DECRBY`), string utility (`STRLEN`,
+`APPEND`), keyspace operations (`KEYS <glob>`, `DBSIZE`, `FLUSHDB`),
+and atomic variants (`SETNX`, `GETSET`). Done.
+
+Total command set: `PING`, `GET`, `SET`, `DEL`, `EXISTS`, `COMMAND`,
+`INCR`, `DECR`, `INCRBY`, `DECRBY`, `STRLEN`, `APPEND`, `KEYS`,
+`DBSIZE`, `FLUSHDB`, `SETNX`, `GETSET`.
 
 ## Layout
 
@@ -31,7 +38,9 @@ Redis-in-C/
 │   ├── bytebuf.h      # growable byte buffer (per-connection read/write)
 │   ├── bytebuf.c
 │   ├── command.h      # command dispatcher
-│   ├── command.c      # PING / GET / SET / DEL / EXISTS / COMMAND
+│   ├── command.c      # 17 commands: PING/GET/SET/DEL/EXISTS/COMMAND/
+│   │                  # INCR/DECR/INCRBY/DECRBY/STRLEN/APPEND/KEYS/
+│   │                  # DBSIZE/FLUSHDB/SETNX/GETSET
 │   └── main.c         # smoke tests, then enters the epoll loop
 └── README.md
 ```
@@ -60,7 +69,7 @@ cmake --build build
 is generated automatically -- symlink or copy it to the repo root if your
 LSP (clangd, ccls) looks for it there.
 
-## Phase 2 - talking to `redis-cli`
+## Phase 2/3 - talking to `redis-cli`
 
 Once the three smoke tests print all-OK, the server listens on
 `127.0.0.1:6379`. In another terminal:
@@ -89,6 +98,71 @@ real Redis:
 ```bash
 127.0.0.1:6379> PING "hello world"
 "hello world"
+```
+
+### Phase 3 commands
+
+Integer arithmetic on string-encoded numbers:
+
+```bash
+127.0.0.1:6379> SET counter 10
+OK
+127.0.0.1:6379> INCR counter
+(integer) 11
+127.0.0.1:6379> INCRBY counter 100
+(integer) 111
+127.0.0.1:6379> DECRBY counter 50
+(integer) 61
+127.0.0.1:6379> SET notnum "hello"
+OK
+127.0.0.1:6379> INCR notnum
+(error) ERR value is not an integer or out of range
+```
+
+String utility:
+
+```bash
+127.0.0.1:6379> APPEND name "Alice"
+(integer) 5
+127.0.0.1:6379> APPEND name " Smith"
+(integer) 11
+127.0.0.1:6379> STRLEN name
+(integer) 11
+127.0.0.1:6379> GET name
+"Alice Smith"
+```
+
+Keyspace operations with full Redis-style glob patterns:
+
+```bash
+127.0.0.1:6379> KEYS *
+1) "counter"
+2) "name"
+3) "notnum"
+127.0.0.1:6379> KEYS n*
+1) "name"
+2) "notnum"
+127.0.0.1:6379> KEYS [ck]*
+1) "counter"
+127.0.0.1:6379> DBSIZE
+(integer) 3
+127.0.0.1:6379> FLUSHDB
+OK
+127.0.0.1:6379> DBSIZE
+(integer) 0
+```
+
+Atomic create / replace:
+
+```bash
+127.0.0.1:6379> SETNX session "alice"
+(integer) 1
+127.0.0.1:6379> SETNX session "bob"
+(integer) 0
+127.0.0.1:6379> GETSET session "carol"
+"alice"
+127.0.0.1:6379> GET session
+"carol"
 ```
 
 The server prints `[networking] accepted fd=...` / `closed fd=...` log

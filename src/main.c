@@ -258,6 +258,20 @@ static int bytebuf_eq(const bytebuf_t *b, const void *expected, size_t expected_
     return memcmp(bytebuf_data(b), expected, expected_len) == 0;
 }
 
+/* Prefix check -- handy for KEYS * where the trailing element order
+ * is hashtable-bucket-dependent so byte-exact comparison would be
+ * brittle. */
+static int bytebuf_starts_with(const bytebuf_t *b, const void *prefix, size_t plen)
+{
+    if (bytebuf_len(b) < plen) {
+        return 0;
+    }
+    if (plen == 0) {
+        return 1;
+    }
+    return memcmp(bytebuf_data(b), prefix, plen) == 0;
+}
+
 #define CMD_CHECK(name, cond) do {                                        \
     g_cmd_total++;                                                        \
     if (cond) {                                                           \
@@ -426,6 +440,435 @@ static void command_smoke_test(void)
             rc == 0 && bytebuf_eq(&out,
                                   "-ERR wrong number of arguments for 'SET'\r\n",
                                   42));
+        bytebuf_reset(&out);
+    }
+
+    /* --------------------------------------------------------------------- */
+    /* Phase 3: integer arithmetic                                           */
+    /* --------------------------------------------------------------------- */
+
+    /* 12. FLUSHDB wipes the slate left by Phase 1's smoke test (which
+     *     populated "hello" and the binary "a\\x00b" key) and lets us
+     *     reason about subsequent cases from a clean state. */
+    {
+        resp_request_t req = {
+            .argc = 1,
+            .args = { { (const unsigned char *)"FLUSHDB", 7 } }
+        };
+        int rc = command_execute(&ctx, &req);
+        CMD_CHECK("FLUSHDB (reset state)", rc == 0 && bytebuf_eq(&out, "+OK\r\n", 5));
+        bytebuf_reset(&out);
+    }
+
+    /* 13. INCR on a fresh key starts from 0 -> :1 */
+    {
+        resp_request_t req = {
+            .argc = 2,
+            .args = {
+                { (const unsigned char *)"INCR",    4 },
+                { (const unsigned char *)"counter", 7 }
+            }
+        };
+        int rc = command_execute(&ctx, &req);
+        CMD_CHECK("INCR counter (new)", rc == 0 && bytebuf_eq(&out, ":1\r\n", 4));
+        bytebuf_reset(&out);
+    }
+
+    /* 14. INCR again bumps the existing value to 2. */
+    {
+        resp_request_t req = {
+            .argc = 2,
+            .args = {
+                { (const unsigned char *)"INCR",    4 },
+                { (const unsigned char *)"counter", 7 }
+            }
+        };
+        int rc = command_execute(&ctx, &req);
+        CMD_CHECK("INCR counter", rc == 0 && bytebuf_eq(&out, ":2\r\n", 4));
+        bytebuf_reset(&out);
+    }
+
+    /* 15. INCRBY counter 10 -> :12 */
+    {
+        resp_request_t req = {
+            .argc = 3,
+            .args = {
+                { (const unsigned char *)"INCRBY",  6 },
+                { (const unsigned char *)"counter", 7 },
+                { (const unsigned char *)"10",      2 }
+            }
+        };
+        int rc = command_execute(&ctx, &req);
+        CMD_CHECK("INCRBY counter 10", rc == 0 && bytebuf_eq(&out, ":12\r\n", 5));
+        bytebuf_reset(&out);
+    }
+
+    /* 16. DECRBY counter 5 -> :7 */
+    {
+        resp_request_t req = {
+            .argc = 3,
+            .args = {
+                { (const unsigned char *)"DECRBY",  6 },
+                { (const unsigned char *)"counter", 7 },
+                { (const unsigned char *)"5",       1 }
+            }
+        };
+        int rc = command_execute(&ctx, &req);
+        CMD_CHECK("DECRBY counter 5", rc == 0 && bytebuf_eq(&out, ":7\r\n", 4));
+        bytebuf_reset(&out);
+    }
+
+    /* 17. DECR counter -> :6 */
+    {
+        resp_request_t req = {
+            .argc = 2,
+            .args = {
+                { (const unsigned char *)"DECR",    4 },
+                { (const unsigned char *)"counter", 7 }
+            }
+        };
+        int rc = command_execute(&ctx, &req);
+        CMD_CHECK("DECR counter", rc == 0 && bytebuf_eq(&out, ":6\r\n", 4));
+        bytebuf_reset(&out);
+    }
+
+    /* 18. Plant a non-integer value so INCR can refuse it next. */
+    {
+        resp_request_t req = {
+            .argc = 3,
+            .args = {
+                { (const unsigned char *)"SET",     3 },
+                { (const unsigned char *)"not_int", 7 },
+                { (const unsigned char *)"hello",   5 }
+            }
+        };
+        int rc = command_execute(&ctx, &req);
+        CMD_CHECK("SET not_int hello", rc == 0 && bytebuf_eq(&out, "+OK\r\n", 5));
+        bytebuf_reset(&out);
+    }
+
+    /* 19. INCR on a non-integer value yields the standard Redis error. */
+    {
+        resp_request_t req = {
+            .argc = 2,
+            .args = {
+                { (const unsigned char *)"INCR",    4 },
+                { (const unsigned char *)"not_int", 7 }
+            }
+        };
+        int rc = command_execute(&ctx, &req);
+        CMD_CHECK("INCR not_int (error)",
+            rc == 0 && bytebuf_eq(&out,
+                "-ERR value is not an integer or out of range\r\n", 46));
+        bytebuf_reset(&out);
+    }
+
+    /* --------------------------------------------------------------------- */
+    /* Phase 3: string utility                                               */
+    /* --------------------------------------------------------------------- */
+
+    /* 20. counter currently holds "6" (1 byte). */
+    {
+        resp_request_t req = {
+            .argc = 2,
+            .args = {
+                { (const unsigned char *)"STRLEN",  6 },
+                { (const unsigned char *)"counter", 7 }
+            }
+        };
+        int rc = command_execute(&ctx, &req);
+        CMD_CHECK("STRLEN counter", rc == 0 && bytebuf_eq(&out, ":1\r\n", 4));
+        bytebuf_reset(&out);
+    }
+
+    /* 21. STRLEN on a missing key returns 0 (per real Redis). */
+    {
+        resp_request_t req = {
+            .argc = 2,
+            .args = {
+                { (const unsigned char *)"STRLEN",  6 },
+                { (const unsigned char *)"missing", 7 }
+            }
+        };
+        int rc = command_execute(&ctx, &req);
+        CMD_CHECK("STRLEN missing", rc == 0 && bytebuf_eq(&out, ":0\r\n", 4));
+        bytebuf_reset(&out);
+    }
+
+    /* 22. APPEND on a new key behaves like SET, returns the length. */
+    {
+        resp_request_t req = {
+            .argc = 3,
+            .args = {
+                { (const unsigned char *)"APPEND",   6 },
+                { (const unsigned char *)"greeting", 8 },
+                { (const unsigned char *)"Hello",    5 }
+            }
+        };
+        int rc = command_execute(&ctx, &req);
+        CMD_CHECK("APPEND greeting Hello (new)",
+            rc == 0 && bytebuf_eq(&out, ":5\r\n", 4));
+        bytebuf_reset(&out);
+    }
+
+    /* 23. APPEND to an existing key concatenates and returns new length. */
+    {
+        resp_request_t req = {
+            .argc = 3,
+            .args = {
+                { (const unsigned char *)"APPEND",   6 },
+                { (const unsigned char *)"greeting", 8 },
+                { (const unsigned char *)" World",   6 }
+            }
+        };
+        int rc = command_execute(&ctx, &req);
+        CMD_CHECK("APPEND greeting \" World\"",
+            rc == 0 && bytebuf_eq(&out, ":11\r\n", 5));
+        bytebuf_reset(&out);
+    }
+
+    /* 24. GET greeting -> "Hello World" (proves the concat worked). */
+    {
+        resp_request_t req = {
+            .argc = 2,
+            .args = {
+                { (const unsigned char *)"GET",      3 },
+                { (const unsigned char *)"greeting", 8 }
+            }
+        };
+        int rc = command_execute(&ctx, &req);
+        CMD_CHECK("GET greeting (after APPEND)",
+            rc == 0 && bytebuf_eq(&out, "$11\r\nHello World\r\n", 18));
+        bytebuf_reset(&out);
+    }
+
+    /* --------------------------------------------------------------------- */
+    /* Phase 3: keyspace (KEYS / DBSIZE / FLUSHDB)                            */
+    /* --------------------------------------------------------------------- */
+
+    /* 25. Clean slate before the keyspace cases. */
+    {
+        resp_request_t req = {
+            .argc = 1,
+            .args = { { (const unsigned char *)"FLUSHDB", 7 } }
+        };
+        int rc = command_execute(&ctx, &req);
+        CMD_CHECK("FLUSHDB (pre-keyspace)",
+            rc == 0 && bytebuf_eq(&out, "+OK\r\n", 5));
+        bytebuf_reset(&out);
+    }
+
+    /* 26. DBSIZE on an empty keyspace. */
+    {
+        resp_request_t req = {
+            .argc = 1,
+            .args = { { (const unsigned char *)"DBSIZE", 6 } }
+        };
+        int rc = command_execute(&ctx, &req);
+        CMD_CHECK("DBSIZE (empty)", rc == 0 && bytebuf_eq(&out, ":0\r\n", 4));
+        bytebuf_reset(&out);
+    }
+
+    /* 27-29. Seed three known keys. */
+    {
+        const char *keys[3] = { "k1", "k2", "k3" };
+        const char *vals[3] = { "v1", "v2", "v3" };
+        for (int i = 0; i < 3; ++i) {
+            resp_request_t req = {
+                .argc = 3,
+                .args = {
+                    { (const unsigned char *)"SET", 3 },
+                    { (const unsigned char *)keys[i], 2 },
+                    { (const unsigned char *)vals[i], 2 }
+                }
+            };
+            int rc = command_execute(&ctx, &req);
+            char label[32];
+            snprintf(label, sizeof label, "SET %s %s", keys[i], vals[i]);
+            CMD_CHECK(label, rc == 0 && bytebuf_eq(&out, "+OK\r\n", 5));
+            bytebuf_reset(&out);
+        }
+    }
+
+    /* 30. DBSIZE now reports 3. */
+    {
+        resp_request_t req = {
+            .argc = 1,
+            .args = { { (const unsigned char *)"DBSIZE", 6 } }
+        };
+        int rc = command_execute(&ctx, &req);
+        CMD_CHECK("DBSIZE (3 keys)", rc == 0 && bytebuf_eq(&out, ":3\r\n", 4));
+        bytebuf_reset(&out);
+    }
+
+    /* 31. KEYS k1 (literal, no glob metacharacters) matches exactly one. */
+    {
+        resp_request_t req = {
+            .argc = 2,
+            .args = {
+                { (const unsigned char *)"KEYS", 4 },
+                { (const unsigned char *)"k1",   2 }
+            }
+        };
+        int rc = command_execute(&ctx, &req);
+        CMD_CHECK("KEYS k1 (literal match)",
+            rc == 0 && bytebuf_eq(&out, "*1\r\n$2\r\nk1\r\n", 12));
+        bytebuf_reset(&out);
+    }
+
+    /* 32. KEYS nope* matches nothing. */
+    {
+        resp_request_t req = {
+            .argc = 2,
+            .args = {
+                { (const unsigned char *)"KEYS",  4 },
+                { (const unsigned char *)"nope*", 5 }
+            }
+        };
+        int rc = command_execute(&ctx, &req);
+        CMD_CHECK("KEYS nope* (no match)",
+            rc == 0 && bytebuf_eq(&out, "*0\r\n", 4));
+        bytebuf_reset(&out);
+    }
+
+    /* 33. KEYS * returns all 3 keys. Hashtable bucket order is
+     *     implementation-defined, so we check the array header and
+     *     total length rather than byte-equal a fixed ordering. */
+    {
+        resp_request_t req = {
+            .argc = 2,
+            .args = {
+                { (const unsigned char *)"KEYS", 4 },
+                { (const unsigned char *)"*",    1 }
+            }
+        };
+        int rc = command_execute(&ctx, &req);
+        /* "*3\r\n" header (4 bytes) + 3 * "$2\r\nXX\r\n" (8 bytes each) = 28. */
+        CMD_CHECK("KEYS * (3 keys, any order)",
+            rc == 0
+            && bytebuf_starts_with(&out, "*3\r\n", 4)
+            && bytebuf_len(&out) == 28);
+        bytebuf_reset(&out);
+    }
+
+    /* 34. FLUSHDB returns the world to empty. */
+    {
+        resp_request_t req = {
+            .argc = 1,
+            .args = { { (const unsigned char *)"FLUSHDB", 7 } }
+        };
+        int rc = command_execute(&ctx, &req);
+        CMD_CHECK("FLUSHDB (post-keyspace)",
+            rc == 0 && bytebuf_eq(&out, "+OK\r\n", 5));
+        bytebuf_reset(&out);
+    }
+
+    /* 35. ...and DBSIZE confirms it. */
+    {
+        resp_request_t req = {
+            .argc = 1,
+            .args = { { (const unsigned char *)"DBSIZE", 6 } }
+        };
+        int rc = command_execute(&ctx, &req);
+        CMD_CHECK("DBSIZE (post-flush)",
+            rc == 0 && bytebuf_eq(&out, ":0\r\n", 4));
+        bytebuf_reset(&out);
+    }
+
+    /* --------------------------------------------------------------------- */
+    /* Phase 3: atomic variants                                              */
+    /* --------------------------------------------------------------------- */
+
+    /* 36. SETNX on a missing key sets and returns :1. */
+    {
+        resp_request_t req = {
+            .argc = 3,
+            .args = {
+                { (const unsigned char *)"SETNX", 5 },
+                { (const unsigned char *)"sk",    2 },
+                { (const unsigned char *)"first", 5 }
+            }
+        };
+        int rc = command_execute(&ctx, &req);
+        CMD_CHECK("SETNX sk first (new)", rc == 0 && bytebuf_eq(&out, ":1\r\n", 4));
+        bytebuf_reset(&out);
+    }
+
+    /* 37. SETNX on an existing key does nothing, returns :0. */
+    {
+        resp_request_t req = {
+            .argc = 3,
+            .args = {
+                { (const unsigned char *)"SETNX",  5 },
+                { (const unsigned char *)"sk",     2 },
+                { (const unsigned char *)"second", 6 }
+            }
+        };
+        int rc = command_execute(&ctx, &req);
+        CMD_CHECK("SETNX sk second (no-op)",
+            rc == 0 && bytebuf_eq(&out, ":0\r\n", 4));
+        bytebuf_reset(&out);
+    }
+
+    /* 38. The original value is still in place. */
+    {
+        resp_request_t req = {
+            .argc = 2,
+            .args = {
+                { (const unsigned char *)"GET", 3 },
+                { (const unsigned char *)"sk",  2 }
+            }
+        };
+        int rc = command_execute(&ctx, &req);
+        CMD_CHECK("GET sk (after SETNX no-op)",
+            rc == 0 && bytebuf_eq(&out, "$5\r\nfirst\r\n", 11));
+        bytebuf_reset(&out);
+    }
+
+    /* 39. GETSET on a missing key returns nil and creates it. */
+    {
+        resp_request_t req = {
+            .argc = 3,
+            .args = {
+                { (const unsigned char *)"GETSET", 6 },
+                { (const unsigned char *)"gs",     2 },
+                { (const unsigned char *)"v1",     2 }
+            }
+        };
+        int rc = command_execute(&ctx, &req);
+        CMD_CHECK("GETSET gs v1 (new)",
+            rc == 0 && bytebuf_eq(&out, "$-1\r\n", 5));
+        bytebuf_reset(&out);
+    }
+
+    /* 40. GETSET on an existing key returns the old value and overwrites. */
+    {
+        resp_request_t req = {
+            .argc = 3,
+            .args = {
+                { (const unsigned char *)"GETSET", 6 },
+                { (const unsigned char *)"gs",     2 },
+                { (const unsigned char *)"v2",     2 }
+            }
+        };
+        int rc = command_execute(&ctx, &req);
+        CMD_CHECK("GETSET gs v2 (replace)",
+            rc == 0 && bytebuf_eq(&out, "$2\r\nv1\r\n", 8));
+        bytebuf_reset(&out);
+    }
+
+    /* 41. Confirm the new value landed. */
+    {
+        resp_request_t req = {
+            .argc = 2,
+            .args = {
+                { (const unsigned char *)"GET", 3 },
+                { (const unsigned char *)"gs",  2 }
+            }
+        };
+        int rc = command_execute(&ctx, &req);
+        CMD_CHECK("GET gs (after GETSET)",
+            rc == 0 && bytebuf_eq(&out, "$2\r\nv2\r\n", 8));
         bytebuf_reset(&out);
     }
 

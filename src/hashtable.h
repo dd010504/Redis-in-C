@@ -104,4 +104,23 @@ int ht_del(hashtable_t *ht,
  * without re-implementing the algorithm. */
 uint64_t ht_hash(const void *key, size_t klen);
 
+/* ht_scan: walk every live entry in bucket order.
+ *
+ * The callback receives BORROWED pointers (same contract as ht_get's
+ * val_out): valid only for the duration of the call. Returning 0 stops
+ * the scan early; any non-zero return continues to the next entry.
+ *
+ * IMPORTANT: the callback MUST NOT mutate the hashtable (no ht_set /
+ * ht_del / ht_destroy / ht_init from inside it). For a destructive
+ * walk, copy the keys you want first, return from ht_scan, then
+ * mutate.
+ *
+ * Returns the number of entries visited (i.e. the total invocations
+ * of `cb`, including the one that returned 0 to stop). */
+typedef int (*ht_scan_cb)(const void *key, size_t klen,
+                          const void *val, size_t vlen,
+                          void *ud);
+
+size_t ht_scan(const hashtable_t *ht, ht_scan_cb cb, void *ud);
+
 #endif /* REDIS_IN_C_HASHTABLE_H */

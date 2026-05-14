@@ -228,3 +228,26 @@ int ht_get(const hashtable_t *ht,
     }
     return 0;
 }
+
+/* ------------------------------------------------------------------------- */
+/* Iteration                                                                 */
+/* ------------------------------------------------------------------------- */
+
+size_t ht_scan(const hashtable_t *ht, ht_scan_cb cb, void *ud)
+{
+    /* Bucket-order walk: same address-of-buckets layout the rest of the
+     * file uses, so iteration cost is O(HT_NUM_BUCKETS + count) with no
+     * allocation. */
+    size_t visited = 0;
+    for (size_t i = 0; i < HT_NUM_BUCKETS; ++i) {
+        for (ht_entry_t *cur = ht->buckets[i]; cur != NULL; cur = cur->next) {
+            ++visited;
+            if (!cb(cur->key, cur->klen, cur->val, cur->vlen, ud)) {
+                /* Caller asked to stop -- return the count including
+                 * the entry that triggered the stop. */
+                return visited;
+            }
+        }
+    }
+    return visited;
+}
